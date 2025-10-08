@@ -3,9 +3,12 @@ import argparse
 import math
 import torch
 import torchvision
+import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.transforms import ToTensor, Compose, Normalize
 from tqdm import tqdm
+from einops import rearrange
+import torchvision.utils as vutils
 
 from model import *
 from utils import setup_seed
@@ -45,6 +48,8 @@ if __name__ == '__main__':
 
     step_count = 0
     optim.zero_grad()
+    train_losses = []
+    os.makedirs('outputs', exist_ok=True)
     for e in range(args.total_epoch):
         model.train()
         losses = []
@@ -62,6 +67,8 @@ if __name__ == '__main__':
         avg_loss = sum(losses) / len(losses)
         writer.add_scalar('mae_loss', avg_loss, global_step=e)
         print(f'In epoch {e}, average traning loss is {avg_loss}.')
+        train_losses.append(avg_loss)
+        np.save('losses.npy', np.array(train_losses))
 
         ''' visualize the first 16 predicted images on val dataset'''
         model.eval()
@@ -73,6 +80,10 @@ if __name__ == '__main__':
             img = torch.cat([val_img * (1 - mask), predicted_val_img, val_img], dim=0)
             img = rearrange(img, '(v h1 w1) c h w -> c (h1 h) (w1 v w)', w1=2, v=3)
             writer.add_image('mae_image', (img + 1) / 2, global_step=e)
+            # save visualization to disk
+            img_to_save = (img + 1) / 2
+            img_to_save = img_to_save.clamp(0, 1)
+            vutils.save_image(img_to_save, os.path.join('outputs', f'recon_epoch_{e:03d}.png'))
         
         ''' save model '''
         torch.save(model, args.model_path)

@@ -3,9 +3,11 @@ import argparse
 import math
 import torch
 import torchvision
+import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.transforms import ToTensor, Compose, Normalize
 from tqdm import tqdm
+import torchvision.utils as vutils
 
 from model import *
 from utils import setup_seed
@@ -53,9 +55,11 @@ if __name__ == '__main__':
     lr_func = lambda epoch: min((epoch + 1) / (args.warmup_epoch + 1e-8), 0.5 * (math.cos(epoch / args.total_epoch * math.pi) + 1))
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=lr_func, verbose=True)
 
+    os.makedirs('cls_outputs', exist_ok=True)
     best_val_acc = 0
     step_count = 0
     optim.zero_grad()
+    hist = { 'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': [] }
     for e in range(args.total_epoch):
         model.train()
         losses = []
@@ -77,6 +81,8 @@ if __name__ == '__main__':
         avg_train_loss = sum(losses) / len(losses)
         avg_train_acc = sum(acces) / len(acces)
         print(f'In epoch {e}, average training loss is {avg_train_loss}, average training acc is {avg_train_acc}.')
+        hist['train_loss'].append(avg_train_loss)
+        hist['train_acc'].append(avg_train_acc)
 
         model.eval()
         with torch.no_grad():
@@ -93,6 +99,8 @@ if __name__ == '__main__':
             avg_val_loss = sum(losses) / len(losses)
             avg_val_acc = sum(acces) / len(acces)
             print(f'In epoch {e}, average validation loss is {avg_val_loss}, average validation acc is {avg_val_acc}.')  
+            hist['val_loss'].append(avg_val_loss)
+            hist['val_acc'].append(avg_val_acc)
 
         if avg_val_acc > best_val_acc:
             best_val_acc = avg_val_acc
@@ -101,3 +109,26 @@ if __name__ == '__main__':
 
         writer.add_scalars('cls/loss', {'train' : avg_train_loss, 'val' : avg_val_loss}, global_step=e)
         writer.add_scalars('cls/acc', {'train' : avg_train_acc, 'val' : avg_val_acc}, global_step=e)
+        # persist metrics each epoch
+        np.savez(os.path.join('cls_outputs', 'metrics_pretrained.npz' if args.pretrained_model_path else 'metrics_scratch.npz'),
+                 train_loss=np.array(hist['train_loss']), train_acc=np.array(hist['train_acc']),
+                 val_loss=np.array(hist['val_loss']), val_acc=np.array(hist['val_acc']))
+
+        # optional: save prediction grid for pretrained run
+        if args.pretrained_model_path is not None and e in {0, args.total_epoch//2, args.total_epoch-1}:
+            # take first 32 validation images and visualize predictions
+            imgs = []
+            gts = []
+            preds = []
+            with torch.no_grad():
+                for i, (img, label) in enumerate(val_dataloader):
+                    img = img.to(device)
+                    logit = model(img)
+                    pred = logit.argmax(dim=-1).detach().cpu()
+                    imgs.append(img.detach().cpu())
+                    gts.append(label)
+                    preds.append(pred)
+                    break
+            img = torch.cat(imgs, dim=0)[:32]
+            grid = vutils.make_grid(img, nrow=8, normalize=True, scale_each=True)
+            vutils.save_image(grid, os.path.join('cls_outputs', f'pretrained_preds_epoch_{e:03d}.png'))
