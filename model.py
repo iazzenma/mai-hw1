@@ -18,22 +18,69 @@ def take_indexes(sequences, indexes):
     return torch.gather(sequences, 0, repeat(indexes, 't b -> t b c', c=sequences.shape[-1]))
 
 class PatchShuffle(torch.nn.Module):
-    def __init__(self, ratio) -> None:
+    def __init__(self, ratio, strategy: str = 'random', grid_size: int = None) -> None:
         super().__init__()
         self.ratio = ratio
+        self.strategy = strategy
+        self.grid_size = grid_size  # number of patches per side (e.g., 16 for 32/2)
 
-    def forward(self, patches : torch.Tensor):
+    def _grid_coords(self, T):
+        H = W = self.grid_size if self.grid_size is not None else int(np.sqrt(T))
+        return H, W
+
+    def _make_order_for_sample(self, T):
+        """Return a permutation array with visible indexes first, then masked indexes."""
+        vis_T = int(T * (1 - self.ratio))
+        if self.strategy == 'random' or self.grid_size is None:
+            order = np.random.permutation(T)
+            return order, vis_T
+
+        H, W = self._grid_coords(T)
+        # map linear index to (i,j)
+        coords = np.arange(T).reshape(H, W)
+
+        if self.strategy == 'grid':
+            # keep 1/stride^2 visible; for 75% mask, stride=2 keeps 25% visible
+            stride = 2
+            keep = coords[::stride, ::stride].reshape(-1)
+            keep = keep[:vis_T]  # in case rounding differs
+            mask = np.setdiff1d(np.arange(T), keep, assume_unique=False)
+            order = np.concatenate([np.random.permutation(keep), np.random.permutation(mask)])
+            return order, vis_T
+
+        if self.strategy == 'block':
+            # mask a contiguous square block covering ~ ratio fraction
+            mask_area = int(round(T * self.ratio))
+            side = max(1, min(H, int(np.sqrt(mask_area))))
+            # pick random top-left for masked block
+            i0 = np.random.randint(0, H - side + 1)
+            j0 = np.random.randint(0, W - side + 1)
+            masked = coords[i0:i0+side, j0:j0+side].reshape(-1)
+            masked = np.unique(masked)
+            keep = np.setdiff1d(np.arange(T), masked, assume_unique=False)
+            # ensure exact visible count if possible
+            if keep.size > vis_T:
+                keep = np.random.permutation(keep)[:vis_T]
+            order = np.concatenate([np.random.permutation(keep), np.random.permutation(np.setdiff1d(np.arange(T), keep))])
+            return order, vis_T
+
+        # fallback to random
+        order = np.random.permutation(T)
+        return order, vis_T
+
+    def forward(self, patches: torch.Tensor):
         T, B, C = patches.shape
-        remain_T = int(T * (1 - self.ratio))
-
-        indexes = [random_indexes(T) for _ in range(B)]
-        forward_indexes = torch.as_tensor(np.stack([i[0] for i in indexes], axis=-1), dtype=torch.long).to(patches.device)
-        backward_indexes = torch.as_tensor(np.stack([i[1] for i in indexes], axis=-1), dtype=torch.long).to(patches.device)
-
+        orders = []
+        vis_T = int(T * (1 - self.ratio))
+        for _ in range(B):
+            order, vis_count = self._make_order_for_sample(T)
+            orders.append(order)
+            vis_T = vis_count  # same for all samples
+        forward_indexes = torch.as_tensor(np.stack(orders, axis=-1), dtype=torch.long, device=patches.device)
+        backward_indexes = torch.argsort(forward_indexes, dim=0)
         patches = take_indexes(patches, forward_indexes)
-        patches = patches[:remain_T]
-
-        return patches, forward_indexes, backward_indexes
+        patches = patches[:vis_T]
+        return patches, forward_indexes, backward_indexes, vis_T
 
 class MAE_Encoder(torch.nn.Module):
     def __init__(self,
@@ -43,12 +90,17 @@ class MAE_Encoder(torch.nn.Module):
                  num_layer=12,
                  num_head=3,
                  mask_ratio=0.75,
+                 mask_sampling: str = 'random',
+                 encoder_with_mask_token: bool = False,
                  ) -> None:
         super().__init__()
 
         self.cls_token = torch.nn.Parameter(torch.zeros(1, 1, emb_dim))
         self.pos_embedding = torch.nn.Parameter(torch.zeros((image_size // patch_size) ** 2, 1, emb_dim))
-        self.shuffle = PatchShuffle(mask_ratio)
+        self.shuffle = PatchShuffle(mask_ratio, strategy=mask_sampling, grid_size=image_size // patch_size)
+        self.encoder_with_mask_token = encoder_with_mask_token
+        if self.encoder_with_mask_token:
+            self.mask_token_enc = torch.nn.Parameter(torch.zeros(1, 1, emb_dim))
 
         self.patchify = torch.nn.Conv2d(3, emb_dim, patch_size, patch_size)
 
@@ -65,16 +117,35 @@ class MAE_Encoder(torch.nn.Module):
     def forward(self, img):
         patches = self.patchify(img)
         patches = rearrange(patches, 'b c h w -> (h w) b c')
-        patches = patches + self.pos_embedding
+        T, B, C = patches.shape
 
-        patches, forward_indexes, backward_indexes = self.shuffle(patches)
-
-        patches = torch.cat([self.cls_token.expand(-1, patches.shape[1], -1), patches], dim=0)
-        patches = rearrange(patches, 't b c -> b t c')
-        features = self.layer_norm(self.transformer(patches))
-        features = rearrange(features, 'b t c -> t b c')
-
-        return features, backward_indexes
+        if self.encoder_with_mask_token:
+            # shuffle without pos embedding, then fill masked positions with encoder mask tokens, reorder to original, then add pos embedding
+            vis_patches, forward_indexes, backward_indexes, vis_T = self.shuffle(patches)
+            masked_T = T - vis_T
+            if masked_T > 0:
+                mask_tokens = self.mask_token_enc.expand(masked_T, B, -1)
+                seq = torch.cat([vis_patches, mask_tokens], dim=0)  # still in shuffled order
+            else:
+                seq = vis_patches
+            seq = take_indexes(seq, backward_indexes)  # restore original order
+            seq = seq + self.pos_embedding  # add pos embedding
+            seq = torch.cat([self.cls_token.expand(-1, B, -1), seq], dim=0)
+            seq = rearrange(seq, 't b c -> b t c')
+            features = self.layer_norm(self.transformer(seq))
+            features = rearrange(features, 'b t c -> t b c')
+            visible_count = vis_T
+            return features, backward_indexes, visible_count
+        else:
+            # default: add pos, shuffle, drop masked tokens
+            patches = patches + self.pos_embedding
+            vis_patches, forward_indexes, backward_indexes, vis_T = self.shuffle(patches)
+            seq = torch.cat([self.cls_token.expand(-1, vis_patches.shape[1], -1), vis_patches], dim=0)
+            seq = rearrange(seq, 't b c -> b t c')
+            features = self.layer_norm(self.transformer(seq))
+            features = rearrange(features, 'b t c -> t b c')
+            visible_count = vis_T
+            return features, backward_indexes, visible_count
 
 class MAE_Decoder(torch.nn.Module):
     def __init__(self,
@@ -100,10 +171,13 @@ class MAE_Decoder(torch.nn.Module):
         trunc_normal_(self.mask_token, std=.02)
         trunc_normal_(self.pos_embedding, std=.02)
 
-    def forward(self, features, backward_indexes):
+    def forward(self, features, backward_indexes, visible_count: int = None):
         T = features.shape[0]
         backward_indexes = torch.cat([torch.zeros(1, backward_indexes.shape[1]).to(backward_indexes), backward_indexes + 1], dim=0)
-        features = torch.cat([features, self.mask_token.expand(backward_indexes.shape[0] - features.shape[0], features.shape[1], -1)], dim=0)
+        # If encoder did NOT include mask tokens, add them here. Otherwise skip.
+        missing = backward_indexes.shape[0] - features.shape[0]
+        if missing > 0:
+            features = torch.cat([features, self.mask_token.expand(missing, features.shape[1], -1)], dim=0)
         features = take_indexes(features, backward_indexes)
         features = features + self.pos_embedding
 
@@ -114,7 +188,10 @@ class MAE_Decoder(torch.nn.Module):
 
         patches = self.head(features)
         mask = torch.zeros_like(patches)
-        mask[T-1:] = 1
+        if visible_count is None:
+            mask[T-1:] = 1
+        else:
+            mask[visible_count:] = 1
         mask = take_indexes(mask, backward_indexes[1:] - 1)
         img = self.patch2img(patches)
         mask = self.patch2img(mask)
@@ -131,15 +208,17 @@ class MAE_ViT(torch.nn.Module):
                  decoder_layer=4,
                  decoder_head=3,
                  mask_ratio=0.75,
+                 mask_sampling: str = 'random',
+                 encoder_with_mask_token: bool = False,
                  ) -> None:
         super().__init__()
 
-        self.encoder = MAE_Encoder(image_size, patch_size, emb_dim, encoder_layer, encoder_head, mask_ratio)
+        self.encoder = MAE_Encoder(image_size, patch_size, emb_dim, encoder_layer, encoder_head, mask_ratio, mask_sampling, encoder_with_mask_token)
         self.decoder = MAE_Decoder(image_size, patch_size, emb_dim, decoder_layer, decoder_head)
 
     def forward(self, img):
-        features, backward_indexes = self.encoder(img)
-        predicted_img, mask = self.decoder(features,  backward_indexes)
+        features, backward_indexes, visible_count = self.encoder(img)
+        predicted_img, mask = self.decoder(features,  backward_indexes, visible_count)
         return predicted_img, mask
 
 class ViT_Classifier(torch.nn.Module):

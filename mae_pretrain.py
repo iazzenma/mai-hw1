@@ -21,6 +21,8 @@ if __name__ == '__main__':
     parser.add_argument('--base_learning_rate', type=float, default=1.5e-4)
     parser.add_argument('--weight_decay', type=float, default=0.05)
     parser.add_argument('--mask_ratio', type=float, default=0.75)
+    parser.add_argument('--mask_sampling', type=str, default='random', choices=['random','block','grid'])
+    parser.add_argument('--encoder_with_mask_token', action='store_true', help='Use mask tokens inside encoder (ablation c)')
     parser.add_argument('--total_epoch', type=int, default=2000)
     parser.add_argument('--warmup_epoch', type=int, default=200)
     parser.add_argument('--model_path', type=str, default='vit-t-mae.pt')
@@ -41,7 +43,7 @@ if __name__ == '__main__':
     writer = SummaryWriter(os.path.join('logs', 'cifar10', 'mae-pretrain'))
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    model = MAE_ViT(mask_ratio=args.mask_ratio).to(device)
+    model = MAE_ViT(mask_ratio=args.mask_ratio, mask_sampling=args.mask_sampling, encoder_with_mask_token=args.encoder_with_mask_token).to(device)
     optim = torch.optim.AdamW(model.parameters(), lr=args.base_learning_rate * args.batch_size / 256, betas=(0.9, 0.95), weight_decay=args.weight_decay)
     lr_func = lambda epoch: min((epoch + 1) / (args.warmup_epoch + 1e-8), 0.5 * (math.cos(epoch / args.total_epoch * math.pi) + 1))
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=lr_func, verbose=True)
